@@ -1,6 +1,6 @@
 # Easel
 
-Easel is a Python script that pulls all of your Canvas coursework into a single JSON file. It shows what's due, what's missing, and what your teachers actually asked for, all in one place. You can read the file yourself or give it to an AI assistant to help plan your week and study.
+Easel is a Python script that pulls all of your Canvas coursework into a single JSON file. It shows what's due, what's missing, and what your teachers actually asked for, all in one place. You can give this file to any LLM to have it complete your coursework for you.
 
 ## Requirements
 

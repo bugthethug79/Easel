@@ -6,6 +6,7 @@ Easel is a Python script that pulls all of your Canvas coursework into a single 
 
 - Python 3
 - A Canvas account that lets students create API tokens (some districts turn this off)
+- Claude (Free or Pro works)
 
 ## Setup
 
@@ -18,6 +19,13 @@ Easel is a Python script that pulls all of your Canvas coursework into a single 
    CANVAS_URL=https://yourschool.instructure.com
 5. Run the script: `python main.py`
 6. Easel writes `canvas_data.json` (and saves attachments to `attachments/`) in the project folder.
+
+## Using Claude
+**(WEB CLIENT)**
+
+1. Create a new project folder in Claude
+2. Add the claude-instructions.txt file to the project instructions
+3. Add your output data & past assignments to the context for Claude to copy your writing style
 
 ## What It Tracks
 

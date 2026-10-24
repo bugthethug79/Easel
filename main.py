@@ -8,7 +8,7 @@ import hashlib
 import threading
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -287,6 +287,9 @@ def parse_html(html):
             if slug not in slugs:
                 slugs.append(slug)
             continue
+        wrapped = re.search(r"https://docs\.google\.com/[^\s\"'&<>]+", unquote(href))
+        if wrapped and "google.com" not in host:
+            href, is_canvas = wrapped.group(0), False
         if href.startswith("http") and not is_canvas and href not in seen:
             seen.add(href)
             external.append({"text": tag.get_text(strip=True) or f"[{tag.name}]", "url": href})
@@ -364,7 +367,80 @@ def extract_text(path):
         return None, f"Extraction failed: {e}"
 
 
-def _build_attachment(cid, fid):
+MANIFEST_FILE = os.path.join(ATTACH_DIR, "index.json")
+MANIFEST = {}
+_manifest_lock = threading.Lock()
+
+
+def load_manifest():
+    try:
+        with open(MANIFEST_FILE, encoding="utf-8") as f:
+            MANIFEST.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+
+
+def save_manifest():
+    if MANIFEST:
+        os.makedirs(ATTACH_DIR, exist_ok=True)
+        write_json(MANIFEST_FILE, MANIFEST)
+
+
+def safe_name(s, limit=80):
+    s = re.sub(r"[^\w\-]+", "_", s or "").strip("_")
+    return re.sub(r"_+", "_", s)[:limit].rstrip("_")
+
+
+def claim_path(key, label, filename):
+    with _manifest_lock:
+        prev = MANIFEST.get(key)
+        if prev and prev.get("path"):
+            return prev["path"]
+        stem, ext = os.path.splitext(filename)
+        stem, label = safe_name(stem), safe_name(label, 60)
+        if label and stem:
+            stem = f"{label}_({stem})"
+        elif label:
+            stem = label
+        stem = stem or "file"
+        taken = {v.get("path") for v in MANIFEST.values()}
+        path = os.path.join(ATTACH_DIR, f"{stem}{ext.lower()}")
+        n = 2
+        while path in taken or os.path.exists(path):
+            path = os.path.join(ATTACH_DIR, f"{stem}_{n}{ext.lower()}")
+            n += 1
+        MANIFEST[key] = {"path": path}
+        return path
+
+
+def _remember(key, **fields):
+    with _manifest_lock:
+        MANIFEST.setdefault(key, {}).update(fields)
+
+
+def _text_for(path):
+    txt_path = path + ".txt"
+    if os.path.exists(txt_path):
+        with open(txt_path, encoding="utf-8") as f:
+            return f.read(), None, txt_path
+    text, note = extract_text(path)
+    if text:
+        write_text(txt_path, text)
+    return text, note, txt_path
+
+
+def _attach_text(info, text, note, txt_path):
+    if text:
+        info["text"] = text[:TEXT_IN_JSON_LIMIT]
+        if len(text) > TEXT_IN_JSON_LIMIT:
+            info["text_truncated"] = True
+            info["full_text_file"] = txt_path
+    if note:
+        info["note"] = note
+    return compact(info)
+
+
+def _build_attachment(cid, fid, label):
     meta = None
     if cid:
         meta = get_one(f"/api/v1/courses/{cid}/files/{fid}")
@@ -385,51 +461,38 @@ def _build_attachment(cid, fid):
         return info
 
     os.makedirs(ATTACH_DIR, exist_ok=True)
-    safe = re.sub(r"[^\w.\- ]", "_", name)[:120]
-    path = os.path.join(ATTACH_DIR, f"{fid}_{safe}")
-    txt_path = path + ".txt"
-
-    if os.path.exists(path) and size and os.path.getsize(path) == size:
+    key = f"file:{fid}"
+    path = claim_path(key, label, name)
+    if os.path.exists(path) and MANIFEST.get(key, {}).get("size") == size:
         _bump("files_reused")
     else:
         _download(meta["url"], path)
         _bump("files_downloaded")
-        if os.path.exists(txt_path):
-            os.remove(txt_path)
+        if os.path.exists(path + ".txt"):
+            os.remove(path + ".txt")
+        _remember(key, size=size)
     info["saved_as"] = path
-
-    if os.path.exists(txt_path):
-        with open(txt_path, encoding="utf-8") as f:
-            text, note = f.read(), None
-    else:
-        text, note = extract_text(path)
-        if text:
-            write_text(txt_path, text)
-
-    if text:
-        info["text"] = text[:TEXT_IN_JSON_LIMIT]
-        if len(text) > TEXT_IN_JSON_LIMIT:
-            info["text_truncated"] = True
-            info["full_text_file"] = txt_path
-    if note:
-        info["note"] = note
-    return compact(info)
+    return _attach_text(info, *_text_for(path))
 
 
-def get_attachment(cid, fid):
-    return memo(("file", fid), lambda: _build_attachment(cid, fid))
+def get_attachment(cid, fid, label=""):
+    return memo(("file", fid), lambda: _build_attachment(cid, fid, label))
 
 
 _public_local = threading.local()
-GDOC_PUB = re.compile(r"docs\.google\.com/(document|spreadsheets|presentation)/d/e/([\w-]+)/pub")
-GDOC_ID = re.compile(r"docs\.google\.com/document/(?:u/\d+/)?d/([\w-]{20,})")
+GDOC_PUB = re.compile(r"docs\.google\.com/(document|spreadsheets|presentation)/d/e/([\w-]+)")
+GDOC_ID = re.compile(r"docs\.google\.com/(document|spreadsheets|presentation)/(?:u/\d+/)?d/([\w-]{20,})")
+GOOGLE_RESTRICTED_NOTE = (
+    "Couldn't open it without a Google login (probably limited to your school account). "
+    "Open it, then download it or paste the text."
+)
 
 
 def _public_session():
     s = getattr(_public_local, "session", None)
     if s is None:
         s = requests.Session()
-        s.headers["User-Agent"] = "Mozilla/5.0 (canvas-puller)"
+        s.headers["User-Agent"] = "Mozilla/5.0 (easel)"
         adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1,
                                                 status_forcelist=(429, 500, 502, 503, 504)))
         s.mount("https://", adapter)
@@ -441,62 +504,97 @@ def is_google_doc(url):
     return bool(GDOC_PUB.search(url) or GDOC_ID.search(url))
 
 
-def _build_google_doc(url):
-    info = {"url": url}
+def _google_candidates(url):
     m = GDOC_PUB.search(url)
     if m:
-        kind, pub_id = m.groups()
-        if kind == "presentation":
-            info["note"] = "Published Google Slides. Open the link to view it."
-            return info
-        page = "pubhtml" if kind == "spreadsheets" else "pub"
-        fetch_url = f"https://docs.google.com/{kind}/d/e/{pub_id}/{page}"
-    else:
-        m = GDOC_ID.search(url)
-        if not m:
-            return None
-        fetch_url = f"https://docs.google.com/document/d/{m.group(1)}/export?format=txt"
+        kind, pid = m.groups()
+        base = f"https://docs.google.com/{kind}/d/e/{pid}"
+        if kind == "document":
+            return kind, [(f"{base}/pub", ".html")]
+        if kind == "spreadsheets":
+            return kind, [(f"{base}/pub?output=xlsx", ".xlsx"), (f"{base}/pubhtml", ".html")]
+        return kind, [(f"{base}/pub?output=pptx", ".pptx"), (f"{base}/pub?output=pdf", ".pdf"),
+                      (f"{base}/pub", ".html")]
+    m = GDOC_ID.search(url)
+    if not m:
+        return None, []
+    kind, gid = m.groups()
+    base = f"https://docs.google.com/{kind}/d/{gid}"
+    if kind == "document":
+        return kind, [(f"{base}/export?format=docx", ".docx"), (f"{base}/export?format=txt", ".txt")]
+    if kind == "spreadsheets":
+        return kind, [(f"{base}/export?format=xlsx", ".xlsx")]
+    return kind, [(f"{base}/export/pptx", ".pptx"), (f"{base}/export/pdf", ".pdf")]
 
-    r = _public_session().get(fetch_url, timeout=60)
-    _bump("requests")
-    if not r.ok or "accounts.google.com" in r.url or "ServiceLogin" in r.url:
-        info["note"] = "Not public (needs a Google login). Open it and paste the text."
-        return info
 
-    if "text/plain" in r.headers.get("Content-Type", ""):
-        text = r.text.lstrip("\ufeff")
-    else:
-        soup = _strip_noise(BeautifulSoup(r.text, "html.parser"))
-        if soup.title:
-            info["title"] = soup.title.get_text(strip=True)
-        node = soup.find(id="contents") or soup.body or soup
-        text = node.get_text("\n", strip=True)
+def _download_name(r, fallback):
+    cd = r.headers.get("Content-Disposition", "")
+    m = re.search(r"filename\*=UTF-8''([^;]+)", cd) or re.search(r'filename="?([^";]+)"?', cd)
+    return unquote(m.group(1)) if m else fallback
 
-    if not text.strip():
-        info["note"] = "Doc loaded but had no text."
-        return info
 
+def _build_google_doc(url, label):
+    kind, candidates = _google_candidates(url)
+    if not candidates:
+        return None
+    info = {"url": url, "kind": kind}
     os.makedirs(ATTACH_DIR, exist_ok=True)
-    txt_path = os.path.join(ATTACH_DIR, f"gdoc_{hashlib.sha1(fetch_url.encode()).hexdigest()[:12]}.txt")
-    write_text(txt_path, text)
-    info["saved_as"] = txt_path
-    info["text"] = text[:TEXT_IN_JSON_LIMIT]
-    if len(text) > TEXT_IN_JSON_LIMIT:
-        info["text_truncated"] = True
-    _bump("gdocs_fetched")
-    return compact(info)
+
+    for fetch_url, ext in candidates:
+        try:
+            r = _public_session().get(fetch_url, timeout=90)
+        except requests.RequestException:
+            continue
+        _bump("requests")
+        ctype = r.headers.get("Content-Type", "")
+        if not r.ok or "accounts.google.com" in r.url or "ServiceLogin" in r.url:
+            continue
+        if ext != ".html" and "text/html" in ctype:
+            continue
+
+        key = f"gdoc:{fetch_url}"
+        if ext == ".html":
+            soup = _strip_noise(BeautifulSoup(r.text, "html.parser"))
+            title = soup.title.get_text(strip=True) if soup.title else kind
+            node = soup.find(id="contents") or soup.body or soup
+            text = node.get_text("\n", strip=True)
+            if not text.strip():
+                continue
+            path = claim_path(key, label, f"{title}.txt")
+            write_text(path, text)
+            info.update(title=title, saved_as=path)
+            _bump("gdocs_fetched")
+            return _attach_text(info, text, None, path)
+
+        name = _download_name(r, f"{kind}{ext}")
+        path = claim_path(key, label, name)
+        with open(path, "wb") as f:
+            f.write(r.content)
+        if os.path.exists(path + ".txt"):
+            os.remove(path + ".txt")
+        info.update(title=os.path.splitext(name)[0], saved_as=path)
+        if ext == ".pptx":
+            info["note"] = "Slide images aren't in the text. Upload the saved file if they matter."
+        _bump("gdocs_fetched")
+        text, note, txt_path = _text_for(path)
+        if note and info.get("note"):
+            note = f"{info['note']} {note}"
+        return _attach_text(info, text, note or info.get("note"), txt_path)
+
+    info["note"] = GOOGLE_RESTRICTED_NOTE
+    return info
 
 
-def get_google_doc(url):
-    return memo(("gdoc", url), lambda: _build_google_doc(url))
+def get_google_doc(url, label=""):
+    return memo(("gdoc", url), lambda: _build_google_doc(url, label))
 
 
-def html_block(cid, html):
+def html_block(cid, html, label=""):
     text, fids, slugs, external = parse_html(html)
-    gdocs = [get_google_doc(l["url"]) for l in external if is_google_doc(l["url"])]
+    gdocs = [get_google_doc(l["url"], label) for l in external if is_google_doc(l["url"])]
     return compact({
         "text": text,
-        "attachments": [get_attachment(cid, f) for f in fids],
+        "attachments": [get_attachment(cid, f, label) for f in fids],
         "google_docs": [g for g in gdocs if g],
         "external_links": external,
         "linked_page_slugs": slugs,
@@ -508,7 +606,7 @@ def get_page(cid, slug):
         p = get_one(f"/api/v1/courses/{cid}/pages/{slug}")
         if not p:
             return None
-        blk = html_block(cid, p.get("body"))
+        blk = html_block(cid, p.get("body"), p.get("title"))
         blk.pop("linked_page_slugs", None)
         return compact({"title": p.get("title"), "slug": p.get("url"),
                         "updated_at": p.get("updated_at"),
@@ -521,7 +619,7 @@ def get_quiz(cid, qid):
         q = get_one(f"/api/v1/courses/{cid}/quizzes/{qid}")
         if not q:
             return None
-        blk = html_block(cid, q.get("description"))
+        blk = html_block(cid, q.get("description"), q.get("title"))
         blk.pop("linked_page_slugs", None)
         out = {
             "id": q.get("id"), "title": q.get("title"), "quiz_type": q.get("quiz_type"),
@@ -563,10 +661,11 @@ def get_discussion(cid, tid):
         t = get_one(f"/api/v1/courses/{cid}/discussion_topics/{tid}")
         if not t:
             return None
-        blk = html_block(cid, t.get("message"))
+        blk = html_block(cid, t.get("message"), t.get("title"))
         blk.pop("linked_page_slugs", None)
         atts = blk.pop("attachments", [])
-        atts += [get_attachment(cid, a["id"]) for a in (t.get("attachments") or []) if a.get("id")]
+        atts += [get_attachment(cid, a["id"], t.get("title")) for a in (t.get("attachments") or [])
+                 if a.get("id")]
         out = {"id": t.get("id"), "title": t.get("title"),
                "require_initial_post": t.get("require_initial_post"),
                "message_text": blk.pop("text", None), "attachments": atts, **blk}
@@ -640,7 +739,7 @@ def percent(score, points):
     return round(score / points * 100, 1)
 
 
-def slim_submission(cid, sub, criteria, points_possible):
+def slim_submission(cid, sub, criteria, points_possible, label=""):
     if not sub:
         return None
     me = sub.get("user_id")
@@ -655,7 +754,7 @@ def slim_submission(cid, sub, criteria, points_possible):
             "author": c.get("author_name"),
             "at": c.get("created_at"),
             "text": c.get("comment"),
-            "attachments": [get_attachment(cid, a["id"])
+            "attachments": [get_attachment(cid, a["id"], f"{label}_feedback")
                             for a in (c.get("attachments") or []) if a.get("id")],
         }))
     return compact({
@@ -761,7 +860,7 @@ def build_assignment(cid, cname, a, sub, bucket, now, module_info, group_names):
     if not criteria and rs.get("id"):
         criteria = get_rubric_criteria(cid, rs["id"])
 
-    blk = html_block(cid, a.get("description"))
+    blk = html_block(cid, a.get("description"), a.get("name"))
     linked = [get_page(cid, s) for s in blk.pop("linked_page_slugs", [])]
 
     due = parse_dt(a.get("due_at"))
@@ -798,7 +897,7 @@ def build_assignment(cid, cname, a, sub, bucket, now, module_info, group_names):
         "linked_pages": [p for p in linked if p],
         "rubric": slim_rubric(criteria),
         "rubric_points_total": rs.get("points_possible"),
-        "submission": slim_submission(cid, sub, criteria, a.get("points_possible")),
+        "submission": slim_submission(cid, sub, criteria, a.get("points_possible"), a.get("name")),
         "resubmit": resubmit_info(a, sub, now),
     }
     if "external_tool" in stypes:
@@ -883,7 +982,7 @@ def module_maps(modules):
     return amap, qmap, dmap
 
 
-def resolve_item(cid, it, covered, status_map):
+def resolve_item(cid, it, covered, status_map, module_name=""):
     itype, content_id = it.get("type"), it.get("content_id")
     out = {
         "position": it.get("position"),
@@ -902,7 +1001,7 @@ def resolve_item(cid, it, covered, status_map):
     elif itype == "Page" and it.get("page_url"):
         out["page"] = get_page(cid, it["page_url"])
     elif itype == "File" and content_id:
-        out["file"] = get_attachment(cid, content_id)
+        out["file"] = get_attachment(cid, content_id, module_name)
     elif itype == "Discussion" and content_id:
         out["discussion"] = get_discussion(cid, content_id)
     elif itype == "Quiz" and content_id:
@@ -915,10 +1014,11 @@ def resolve_item(cid, it, covered, status_map):
 
 
 def slim_announcement(cid, a):
-    blk = html_block(cid, a.get("message"))
+    blk = html_block(cid, a.get("message"), a.get("title"))
     blk.pop("linked_page_slugs", None)
     atts = blk.pop("attachments", [])
-    atts += [get_attachment(cid, x["id"]) for x in (a.get("attachments") or []) if x.get("id")]
+    atts += [get_attachment(cid, x["id"], a.get("title")) for x in (a.get("attachments") or [])
+             if x.get("id")]
     return compact({
         "title": a.get("title"),
         "posted_at": a.get("posted_at"),
@@ -1014,7 +1114,8 @@ def build_course(course, enrollment, now, cutoff, pool):
         if topic_id:
             covered.add(("Discussion", topic_id))
     flat = [(i, it) for i, m in enumerate(modules) for it in (m.get("items") or [])]
-    resolved = list(pool.map(lambda x: resolve_item(cid, x[1], covered, status_map), flat))
+    resolved = list(pool.map(
+        lambda x: resolve_item(cid, x[1], covered, status_map, modules[x[0]].get("name")), flat))
     items_by_mod = [[] for _ in modules]
     for (i, _), r in zip(flat, resolved):
         items_by_mod[i].append(r)
@@ -1041,7 +1142,7 @@ def build_course(course, enrollment, now, cutoff, pool):
     announcements = list(pool.map(lambda a: slim_announcement(cid, a), as_list(d["announcements"])))
     fp = d["front_page"]
     front_page = get_page(cid, fp["url"]) if isinstance(fp, dict) and fp.get("url") else None
-    syllabus = html_block(cid, course.get("syllabus_body"))
+    syllabus = html_block(cid, course.get("syllabus_body"), f"{cname}_Syllabus")
     syllabus.pop("linked_page_slugs", None)
 
     print(f"  [{cid}] {cname}: {len(by_bucket['open'])} open, {len(by_bucket['missing'])} overdue, "
@@ -1226,6 +1327,7 @@ def build_summary(dump, now):
 
 def summary_mode(args):
     t0 = time.time()
+    load_manifest()
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=args.days)
 
@@ -1265,6 +1367,7 @@ def summary_mode(args):
     }
     write_json(args.out, dump)
     write_text(SUMMARY_FILE, build_summary(dump, now))
+    save_manifest()
 
     print(f"\nWrote {SUMMARY_FILE}, {args.out}, and {ATTACH_DIR}/")
     print(f"  {STATS['requests']} requests, {STATS['files_downloaded']} files downloaded, "
@@ -1275,6 +1378,7 @@ def summary_mode(args):
 def full_mode(args):
     now = datetime.now(timezone.utc)
     aid = args.full
+    load_manifest()
     print(f"Looking up assignment {aid}...")
     courses = [c for c in list_courses() if c["id"] not in EXCLUDE_COURSES]
 
@@ -1301,6 +1405,7 @@ def full_mode(args):
 
     out = FULL_FILE_TMPL.format(aid=aid)
     write_json(out, {"assignment": built, "errors": ERRORS})
+    save_manifest()
     print(f"Wrote {out} ({STATS['requests']} requests)")
 
 
